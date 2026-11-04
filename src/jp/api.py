@@ -399,16 +399,20 @@ class Api:
             return b""
         return str(content).encode("utf-8")
 
-    def iter_file(self, api_path: str, offset: int = 0) -> tuple[bool, Iterator[bytes]]:
+    def iter_file(
+        self, api_path: str, offset: int = 0, end: int | None = None
+    ) -> tuple[bool, Iterator[bytes]]:
         """Stream raw bytes from ``/files``, without base64 and without buffering.
 
-        Returns ``(resumed, chunks)``: ``resumed`` is False when the server ignored
-        the ``Range`` and is sending from byte 0. Redirects stay unfollowed, because
-        a stopped server answers with its HTML login page and a 200.
+        Asks for bytes ``offset`` up to, not including, ``end``. Returns ``(ranged,
+        chunks)``: ``ranged`` is False when the server ignored the ``Range`` and is
+        sending the whole file. Redirects stay unfollowed, because a stopped server
+        answers with its HTML login page and a 200.
         """
         headers = {"Authorization": f"token {self._token}"}
-        if offset:
-            headers["Range"] = f"bytes={offset}-"
+        if offset or end is not None:
+            last = "" if end is None else end - 1
+            headers["Range"] = f"bytes={offset}-{last}"
         req = urllib.request.Request(self._url(f"files/{api_path}"), headers=headers)
         opener = urllib.request.build_opener(
             _NoRedirect, urllib.request.HTTPSHandler(context=self._ssl_context)
@@ -662,9 +666,9 @@ class Api:
     def create_terminal(self, cwd: str | None = None) -> TerminalSession:
         """Create a remote terminal via ``POST /api/terminals``; return its name.
 
-        This is the ONLY non-file remote call jp makes: a terminal is an
-        ephemeral PTY session, not a path -- it never reads, writes, moves or
-        deletes a file, so the path-jail does not apply.
+        A terminal is an ephemeral PTY session, not a path, so the path-jail does
+        not apply to this call. Whatever runs inside has to confine itself: the
+        archive scripts in bundle.py check every path they touch.
 
         When ``cwd`` is given we request it natively (modern
         ``jupyter_server_terminals`` resolves it relative to the server root,

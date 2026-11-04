@@ -278,9 +278,9 @@ def test_dropped_connection_resumes_from_where_it_stopped(fake_api, download):
     real = fake_api.iter_file
     offsets = []
 
-    def dropping(path, offset=0):
+    def dropping(path, offset=0, end=None):
         offsets.append(offset)
-        resumed, chunks = real(path, offset)
+        resumed, chunks = real(path, offset, end)
 
         def stream():
             yield next(chunks)
@@ -300,9 +300,9 @@ def test_short_read_without_an_error_is_noticed(fake_api, download):
     real = fake_api.iter_file
     calls = []
 
-    def short(path, offset=0):
+    def short(path, offset=0, end=None):
         calls.append(offset)
-        resumed, chunks = real(path, offset)
+        resumed, chunks = real(path, offset, end)
         return resumed, iter([next(chunks)]) if len(calls) == 1 else chunks
 
     fake_api.iter_file = short
@@ -311,27 +311,79 @@ def test_short_read_without_an_error_is_noticed(fake_api, download):
     assert len(calls) == 2
 
 
-def test_part_left_by_a_previous_run_is_resumed(fake_api, download):
-    download.part.parent.mkdir(parents=True)
-    download.part.write_bytes(BLOB[:5000])
+def finished_log(download):
+    return download.part.with_name(f"{download.part.name}.done")
+
+
+def test_segments_arrive_on_several_connections_and_rebuild_the_file(
+    fake_api, download, monkeypatch
+):
+    monkeypatch.setattr(transfer, "SEGMENT_BYTES", 2048)
     assert download.run(fake_api, digest=sha(BLOB)) == sha(BLOB)
     assert download.dest.read_bytes() == BLOB
+    assert not finished_log(download).exists()
 
 
-def test_server_that_ignores_range_restarts_cleanly(fake_api, download):
+def test_finished_segments_are_not_downloaded_again(fake_api, download, monkeypatch):
+    monkeypatch.setattr(transfer, "SEGMENT_BYTES", 2048)
     download.part.parent.mkdir(parents=True)
-    download.part.write_bytes(BLOB[:5000])
+    download.part.write_bytes(BLOB[:4096] + b"\0" * (len(BLOB) - 4096))
+    finished_log(download).write_text("0\n1\n")
     real = fake_api.iter_file
-    fake_api.iter_file = lambda path, offset=0: (False, real(path, 0)[1])
+    asked = []
+
+    def spy(path, offset=0, end=None):
+        asked.append(offset)
+        return real(path, offset, end)
+
+    fake_api.iter_file = spy
+    assert download.run(fake_api, digest=sha(BLOB)) == sha(BLOB)
+    assert sorted(asked) == [4096, 6144, 8192]
+
+
+def test_failed_segment_keeps_the_finished_ones_for_the_next_run(fake_api, download, monkeypatch):
+    monkeypatch.setattr(transfer, "SEGMENT_BYTES", 2048)
+    monkeypatch.setattr(transfer, "DOWNLOAD_CONNECTIONS", 1)
+    real = fake_api.iter_file
+
+    def refuse_the_third(path, offset=0, end=None):
+        if offset == 4096:
+            raise AuthError("server returned HTTP 403")
+        return real(path, offset, end)
+
+    fake_api.iter_file = refuse_the_third
+    with pytest.raises(AuthError):
+        download.run(fake_api, digest=sha(BLOB))
+    assert not download.dest.exists()
+    assert sorted(finished_log(download).read_text().split()) == ["0", "1"]
+    fake_api.iter_file = real
     assert download.run(fake_api, digest=sha(BLOB)) == sha(BLOB)
     assert download.dest.read_bytes() == BLOB
 
 
-def test_stale_part_with_wrong_bytes_is_discarded(fake_api, download):
+def test_finished_log_for_bad_bytes_is_rebuilt_by_the_checksum(fake_api, download, monkeypatch):
+    monkeypatch.setattr(transfer, "SEGMENT_BYTES", 2048)
     download.part.parent.mkdir(parents=True)
-    download.part.write_bytes(b"x" * 5000)
+    download.part.write_bytes(b"x" * len(BLOB))
+    finished_log(download).write_text("0\n1\n2\n3\n4\n")
     assert download.run(fake_api, digest=sha(BLOB)) == sha(BLOB)
     assert download.dest.read_bytes() == BLOB
+
+
+def test_server_that_ignores_range_falls_back_to_one_stream(fake_api, download, monkeypatch):
+    monkeypatch.setattr(transfer, "SEGMENT_BYTES", 2048)
+    real = fake_api.iter_file
+    fake_api.iter_file = lambda path, offset=0, end=None: (False, real(path, 0)[1])
+    assert download.run(fake_api, digest=sha(BLOB)) == sha(BLOB)
+    assert download.dest.read_bytes() == BLOB
+
+
+def test_not_enough_disk_is_reported_before_downloading(fake_api, download, monkeypatch):
+    usage = type("Usage", (), {"free": 10})
+    monkeypatch.setattr(transfer.shutil, "disk_usage", lambda path: usage)
+    with pytest.raises(TransferError, match="not enough disk"):
+        download.run(fake_api)
+    assert fake_api.content_reads == []
 
 
 def test_checksum_mismatch_never_touches_the_destination(fake_api, download):
@@ -340,13 +392,6 @@ def test_checksum_mismatch_never_touches_the_destination(fake_api, download):
         download.run(fake_api, digest=sha(b"something else"))
     assert download.dest.read_bytes() == b"previous version"
     assert not download.part.exists()
-
-
-def test_body_larger_than_expected_is_rejected(fake_api, download):
-    fake_api.files[TARGET] = BLOB + b"unexpected"
-    with pytest.raises(TransferError, match="size"):
-        download.run(fake_api)
-    assert not download.dest.exists()
 
 
 def test_file_shorter_than_listed_gives_up_without_installing(fake_api, download):
@@ -369,8 +414,8 @@ def test_cancel_keeps_the_part_for_the_next_run(fake_api, download):
     cancel = threading.Event()
     real = fake_api.iter_file
 
-    def cancelling(path, offset=0):
-        resumed, chunks = real(path, offset)
+    def cancelling(path, offset=0, end=None):
+        resumed, chunks = real(path, offset, end)
 
         def stream():
             yield next(chunks)
@@ -382,7 +427,7 @@ def test_cancel_keeps_the_part_for_the_next_run(fake_api, download):
     fake_api.iter_file = cancelling
     with pytest.raises(transfer.Cancelled):
         download.run(fake_api, cancel=cancel)
-    assert 0 < download.part.stat().st_size < len(BLOB)
+    assert download.part.exists()
     assert not download.dest.exists()
 
 

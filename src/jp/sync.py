@@ -29,7 +29,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, TypeVar
 
-from . import paths, transfer, ui
+from . import bundle, paths, transfer, ui
 from .api import Api, RemoteEntry
 from .config import Config
 from .errors import ApiError, JpError, TransferError
@@ -522,7 +522,10 @@ def push(
             return entry
 
         try:
-            _run_jobs(uploads, upload, index, outcome)
+            remaining = _push_small_files_as_archive(
+                api, root, cfg, uploads, ignore, created_dirs, index, outcome, meter
+            )
+            _run_jobs(remaining, upload, index, outcome)
         finally:
             meter.close()
 
@@ -597,6 +600,111 @@ def _upload_one(
         remote_hash=sha,  # server sha256 == agreed bytes' sha256
         local_mtime=_safe_mtime(job.path),
     )
+
+
+def _push_small_files_as_archive(
+    api: Api,
+    root: Path,
+    cfg: Config,
+    uploads: list[_Upload],
+    ignore: IgnoreSet,
+    created_dirs: set[str],
+    index: Index,
+    outcome: Outcome,
+    meter: transfer.Meter,
+) -> list[_Upload]:
+    """Send the small files as one archive. Returns what still needs a normal upload,
+    which is everything when the server cannot unpack."""
+    prefix = paths.validate_prefix(cfg.prefix)
+    small = [job for job in uploads if _safe_size(job.path) < transfer.LARGE_FILE_BYTES]
+    if len(small) < bundle.MIN_FILES:
+        return uploads
+    by_wire = {job.remote_path[len(prefix) + 1 :]: job for job in small}
+    archive = root / paths.DOT_DIR / "parts" / f"push-{os.getpid()}.tar"
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        packed = bundle.pack_local({name: job.path for name, job in by_wire.items()}, archive)
+        _ensure_remote_dirs(api, prefix, f"{prefix}/placeholder", created_dirs)
+        bundle.send_archive(api, cfg, archive, meter.add)
+        listing = scan_remote(api, cfg, ignore)
+    except bundle.Unavailable as exc:
+        ui.warn(f"sending files one by one, the archive step failed: {exc}")
+        return uploads
+    finally:
+        archive.unlink(missing_ok=True)
+    sent: set[str] = set()
+    for name, job in by_wire.items():
+        sha, size = packed[name]
+        rentry = listing.get(job.rel)
+        if rentry is None or rentry.size != size:
+            continue
+        index.set(
+            job.rel,
+            Entry(
+                sha256=sha,
+                size=size,
+                remote_mtime=rentry.last_modified,
+                remote_hash=sha,
+                local_mtime=_safe_mtime(job.path),
+            ),
+        )
+        outcome.transferred.append(job.rel)
+        sent.add(job.rel)
+        meter.file_done()
+    index.save()
+    return [job for job in uploads if job.rel not in sent]
+
+
+def _pull_small_files_as_archive(
+    api: Api,
+    root: Path,
+    cfg: Config,
+    downloads: list[_Download],
+    index: Index,
+    outcome: Outcome,
+    meter: transfer.Meter,
+) -> list[_Download]:
+    """Fetch the small files as one archive. Returns what still needs a normal
+    download, which is everything when the server cannot pack."""
+    prefix = paths.validate_prefix(cfg.prefix)
+    small = [job for job in downloads if not _is_large(job.entry)]
+    if len(small) < bundle.MIN_FILES:
+        return downloads
+    by_wire = {job.entry.path[len(prefix) + 1 :]: job for job in small}
+    parts = root / paths.DOT_DIR / "parts"
+    archive = parts / f"pull-{os.getpid()}.tar"
+    received: set[str] = set()
+    try:
+        bundle.fetch_archive(
+            api, cfg, sorted(by_wire), archive, archive.with_suffix(".part"), lambda _: None
+        )
+        for name, data in bundle.read_archive(archive, by_wire):
+            job = by_wire[name]
+            if job.entry.size is not None and len(data) != job.entry.size:
+                continue
+            dest = paths.safe_local_dest(root, job.rel)
+            paths.atomic_write(dest, data, durable=False)
+            sha = sha256_bytes(data)
+            index.set(
+                job.rel,
+                Entry(
+                    sha256=sha,
+                    size=len(data),
+                    remote_mtime=job.entry.last_modified,
+                    remote_hash=sha,
+                    local_mtime=_safe_mtime(dest),
+                ),
+            )
+            outcome.transferred.append(job.rel)
+            received.add(job.rel)
+            meter.add(len(data))
+            meter.file_done()
+    except bundle.Unavailable as exc:
+        ui.warn(f"downloading files one by one, the archive step failed: {exc}")
+    finally:
+        archive.unlink(missing_ok=True)
+    index.save()
+    return [job for job in downloads if job.rel not in received]
 
 
 def _run_jobs(
@@ -706,7 +814,10 @@ def pull(
             return entry
 
         try:
-            _run_jobs(downloads, download, index, outcome)
+            remaining = _pull_small_files_as_archive(
+                api, root, cfg, downloads, index, outcome, meter
+            )
+            _run_jobs(remaining, download, index, outcome)
         finally:
             meter.close()
 

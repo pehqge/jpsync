@@ -60,13 +60,19 @@ overwriting a newer remote version. `--dry-run` previews.
 ### Large files and bulk runs
 `push` and `pull` work the same at any scale; there is nothing to configure.
 
-- **Six transfers run at once**, so a tree of thousands of small files is limited
-  by the server rather than by one-at-a-time requests. A transient network or
-  server error is retried with backoff. One failed file never stops the others,
-  and the summary names each failure with its reason.
+- **Twenty or more small files travel as one archive.** A Hub usually limits how
+  many requests per second it answers, so one request per file is what makes a big
+  tree slow. `jp` packs the files, moves the archive with the same checksum as a
+  large file, and unpacks on the other side. This uses a server terminal; if the
+  server has none, or the step fails, `jp` warns and sends the files one by one.
+- **Files outside the archive run six at a time.** A transient network or server
+  error is retried with backoff. One failed file never stops the others, and the
+  summary names each failure with its reason.
 - **Files of 16 MiB or more never load into memory.** Uploads go in 8 MiB chunks
   to a temporary `__jp_part__.*` file next to the destination; downloads stream
-  from the raw `/files` endpoint to `.jp/parts/`.
+  from the raw `/files` endpoint to `.jp/parts/` in 32 MiB segments over six
+  connections, which is faster because a single connection to a Hub often carries
+  far less than the line can. `jp` checks for free disk space first.
 - **The real file only changes after a checksum match.** An upload is verified
   against the SHA-256 the server computes, then renamed over the destination, so
   a failed run leaves the previous version in place. If the swap itself fails, the
@@ -74,7 +80,8 @@ overwriting a newer remote version. `--dry-run` previews.
   server's trash when the server has one, so it can use quota until the trash is
   emptied.
 - **An interrupted run resumes.** Run the same command again: `jp` asks the server
-  how many bytes it has (or checks `.jp/parts/`) and continues from there. Changing
+  how many bytes it has (or checks which segments finished in `.jp/parts/`) and
+  continues from there. Changing
   the file in the meantime starts a new upload; the old `__jp_part__.*` file stays
   until you remove it with `jp rm`.
 

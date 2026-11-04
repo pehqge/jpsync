@@ -39,7 +39,7 @@ runs — macOS, Windows, Linux.
 - **Git-like workflow** — `jp clone`, `jp status`, `jp push`, `jp pull`. Same muscle memory.
 - **Or skip the copy** — `jp live <url>` mounts the remote folder as a local folder you edit in place, and `jp terminal` drops you into a shell on the server. No SSH, no FUSE, no server-side install.
 - **Safe by default** — on a *shared* research machine, jp never deletes remote files unless you explicitly turn that on, and even then it asks you file-by-file. Conflicts are never silently overwritten.
-- **Handles big files and big trees** — files of any size move in chunks with a checksum at the end, resume after a dropped connection, and never load into memory. Thousands of small files go through in parallel.
+- **Handles big files and big trees** — files of any size move in chunks with a checksum at the end, resume after a dropped connection, and never load into memory. Thousands of small files travel as one archive, in seconds instead of minutes.
 - **Zero dependencies** — one install, no dependency hell; ships as a wheel, a single `.pyz`, or a standalone binary.
 - **Cross-platform** — macOS, Windows, Linux; Python 3.9 → 3.13.
 

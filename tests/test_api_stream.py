@@ -28,11 +28,12 @@ class Stub(BaseHTTPRequestHandler):
     def do_GET(self):
         Stub.seen_headers.append(dict(self.headers))
         if self.path == "/files/ranged.bin":
-            offset = int(self.headers.get("Range", "bytes=0-")[6:-1])
-            self.send_response(206 if offset else 200)
-            self.send_header("Content-Length", str(len(BODY) - offset))
+            first, last = self.headers.get("Range", "bytes=0-")[6:].split("-")
+            piece = BODY[int(first) : int(last) + 1 if last else None]
+            self.send_response(206 if "Range" in self.headers else 200)
+            self.send_header("Content-Length", str(len(piece)))
             self.end_headers()
-            self.wfile.write(BODY[offset:])
+            self.wfile.write(piece)
         elif self.path == "/files/full.bin":
             self.send_response(200)
             self.send_header("Content-Length", str(len(BODY)))
@@ -84,6 +85,13 @@ def test_offset_asks_for_the_rest_and_reports_resumed(api):
     assert resumed is True
     assert b"".join(chunks) == BODY[100:]
     assert Stub.seen_headers[-1]["Range"] == "bytes=100-"
+
+
+def test_end_limits_the_range_and_is_exclusive(api):
+    ranged, chunks = api.iter_file("ranged.bin", 100, 200)
+    assert ranged is True
+    assert b"".join(chunks) == BODY[100:200]
+    assert Stub.seen_headers[-1]["Range"] == "bytes=100-199"
 
 
 def test_server_ignoring_range_is_reported(api):

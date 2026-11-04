@@ -58,6 +58,12 @@ it behaves:
 
 - Creating a hidden file (a dotfile) is rejected by the server, so `jp` skips
   dotfiles on push and reports them rather than failing the whole run.
+- Pushing or pulling twenty or more small files runs a short script in a server
+  terminal to pack or unpack an archive. A terminal is outside the path-jail, so
+  the script confines itself to the workspace prefix: it refuses absolute paths,
+  `..`, links and anything that resolves outside the prefix. Conflict checks run
+  before the archive is built, as they do for any other transfer. Files that were
+  not planned for transfer are never in it.
 - Pushing a new version of a file of 16 MiB or more replaces it through a rename,
   which the server cannot do over an existing file: the previous version moves
   aside, the new one takes its name, and `jp` deletes the moved copy and its own

@@ -38,7 +38,7 @@ def free_port() -> int:
 
 
 class Server:
-    def __init__(self, tmp_path):
+    def __init__(self, tmp_path, *options):
         self.root = tmp_path / "srv"
         (self.root / PREFIX).mkdir(parents=True)
         self.token = "jp-" + os.urandom(8).hex()
@@ -55,6 +55,7 @@ class Server:
                 f"--ServerApp.root_dir={self.root}",
                 "--ServerApp.open_browser=False",
                 "--FileContentsManager.delete_to_trash=False",
+                *options,
             ],
             stdout=self.log,
             stderr=subprocess.STDOUT,
@@ -183,9 +184,38 @@ def test_many_small_files_in_many_folders_round_trip(server, tmp_path):
     outcome = sync.push(root, server.cfg, server.api, index, ignore)
     assert len(outcome.transferred) == 400
     assert outcome.failures == []
+    assert server.on_disk("d3/sub/f3.txt").read_text() == "file 3"
+    assert server.leftovers() == []
+    other, other_index, other_ignore = workspace(tmp_path, "b", server.cfg)
+    pulled = sync.pull(other, server.cfg, server.api, other_index, other_ignore)
+    assert len(pulled.transferred) == 400
+    assert (other / "d3" / "sub" / "f3.txt").read_text() == "file 3"
+    assert server.leftovers() == []
     again = sync.push(root, server.cfg, server.api, Index.load(root), ignore)
     assert again.transferred == []
     assert len(again.up_to_date) == 400
+
+
+def test_many_files_on_a_server_without_terminals_still_arrive(tmp_path):
+    instance = Server(tmp_path, "--ServerApp.terminals_enabled=False")
+    try:
+        root, index, ignore = workspace(tmp_path, "a", instance.cfg)
+        for i in range(25):
+            (root / f"f{i}.txt").write_text(f"file {i}")
+        outcome = sync.push(root, instance.cfg, instance.api, index, ignore)
+        assert len(outcome.transferred) == 25
+        assert instance.on_disk("f7.txt").read_text() == "file 7"
+    finally:
+        instance.stop()
+
+
+def test_large_download_uses_several_connections_for_real(server, tmp_path):
+    blob = noise(70 * MIB)
+    server.on_disk("big.bin").write_bytes(blob)
+    root, index, ignore = workspace(tmp_path, "a", server.cfg)
+    outcome = sync.pull(root, server.cfg, server.api, index, ignore)
+    assert outcome.failures == []
+    assert (root / "big.bin").read_bytes() == blob
 
 
 def test_ignored_large_remote_file_is_not_pulled(server, tmp_path):
