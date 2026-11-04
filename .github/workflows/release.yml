@@ -14,6 +14,11 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Tag to release (e.g. v1.2.3). Defaults to the triggering ref."
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -157,7 +162,7 @@ jobs:
           path: dist
       - name: Drop non-PyPI artifacts
         run: rm -f dist/jp.pyz
-      - uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1 (v1.13.0)
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1 (v1.14.3)
         with:
           # When release-please calls this as a reusable workflow, OIDC auth
           # keys off job_workflow_ref (release.yml -> matches the PyPI Trusted
