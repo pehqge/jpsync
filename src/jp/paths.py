@@ -335,7 +335,7 @@ def safe_local_dest(root: Path, server_name: str) -> Path:
 # --------------------------------------------------------------------------- #
 # Safe atomic local write (refuses to follow symlinks)
 # --------------------------------------------------------------------------- #
-def atomic_write(dest: Path, data: bytes) -> None:
+def atomic_write(dest: Path, data: bytes, *, durable: bool = True) -> None:
     """Atomically write ``data`` to ``dest`` without following a symlink.
 
     If ``dest`` (or its parent) is a symlink we refuse, so a pre-planted symlink
@@ -362,7 +362,8 @@ def atomic_write(dest: Path, data: bytes) -> None:
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
             fh.flush()
-            os.fsync(fh.fileno())
+            if durable:
+                os.fsync(fh.fileno())
     except Exception:
         with contextlib.suppress(OSError):
             os.unlink(str(tmp))
@@ -380,6 +381,19 @@ def open_part(path: Path) -> BinaryIO:
     _ensure_dir_no_symlink(Path(path).parent)
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND | _O_NOFOLLOW, 0o600)
     return os.fdopen(fd, "ab")
+
+
+def prepare_part(path: Path, size: int) -> None:
+    """Create a private ``.jp`` part file of ``size`` bytes for segmented writes."""
+    _ensure_dir_no_symlink(Path(path).parent)
+    fd = os.open(str(path), os.O_RDWR | os.O_CREAT | _O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "r+b") as part:
+        part.truncate(size)
+
+
+def open_segment(path: Path) -> BinaryIO:
+    """Open a prepared part file so one worker can write its own region."""
+    return os.fdopen(os.open(str(path), os.O_RDWR | _O_NOFOLLOW), "r+b")
 
 
 def atomic_install(part: Path, dest: Path) -> None:

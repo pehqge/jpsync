@@ -10,7 +10,9 @@ run through retries and across runs through the leftover part.
 from __future__ import annotations
 
 import hashlib
+import math
 import os
+import shutil
 import sys
 import threading
 import time
@@ -26,6 +28,9 @@ from .errors import ApiError, JpError, NetworkError, ServerDownError, TransferEr
 CHUNK_BYTES = 8 * 1024 * 1024
 LARGE_FILE_BYTES = 16 * 1024 * 1024
 WORKERS = 6
+# One connection to a Hub carries far less than the line can, and several add up.
+DOWNLOAD_CONNECTIONS = 6
+SEGMENT_BYTES = 32 * 1024 * 1024
 MAX_RETRIES = 5
 BACKOFF_S = 1.0
 # The server reads the whole file to hash it, which outlasts the normal timeout.
@@ -38,6 +43,10 @@ Result = TypeVar("Result")
 
 class Cancelled(JpError):
     """The run was interrupted; whatever was sent stays resumable."""
+
+
+class _RangeIgnored(Exception):
+    """The server answered a segment request with the whole file."""
 
 
 def _ignore_progress(_: int) -> None:
@@ -260,15 +269,130 @@ def download_large(
     progress: Callable[[int], None] = _ignore_progress,
 ) -> str:
     """Stream to ``part``, then replace ``dest``. Returns the verified sha256."""
-    sha = _fetch(api, remote_path, part, size, cancel, progress)
-    if digest is not None and sha != digest:
-        part.unlink(missing_ok=True)
-        sha = _fetch(api, remote_path, part, size, cancel, progress)
-    if digest is not None and sha != digest:
-        part.unlink(missing_ok=True)
-        raise TransferError(f"checksum mismatch downloading {remote_path}")
-    paths.atomic_install(part, dest)
-    return sha
+    for _ in range(2):
+        try:
+            _fetch_segments(api, remote_path, part, size, cancel, progress)
+            sha = _file_sha256(part)
+        except _RangeIgnored:
+            _discard(part)
+            sha = _fetch(api, remote_path, part, size, cancel, progress)
+        if digest is None or sha == digest:
+            _finished_log(part).unlink(missing_ok=True)
+            paths.atomic_install(part, dest)
+            return sha
+        _discard(part)
+    raise TransferError(f"checksum mismatch downloading {remote_path}")
+
+
+def _finished_log(part: Path) -> Path:
+    return part.with_name(f"{part.name}.done")
+
+
+def _discard(part: Path) -> None:
+    part.unlink(missing_ok=True)
+    _finished_log(part).unlink(missing_ok=True)
+
+
+def _file_sha256(path: Path) -> str:
+    sha = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1 << 20), b""):
+            sha.update(block)
+    return sha.hexdigest()
+
+
+def _finished_segments(part: Path, count: int) -> set[int]:
+    log = _finished_log(part)
+    if not part.exists() or not log.exists():
+        return set()
+    return {int(line) for line in log.read_text().split() if int(line) < count}
+
+
+def _fetch_segments(
+    api: Api,
+    remote_path: str,
+    part: Path,
+    size: int,
+    cancel: threading.Event,
+    progress: Callable[[int], None],
+) -> None:
+    """Download the missing segments on several connections. A segment counts only
+    once it is fully on disk, which is what lets a later run skip it."""
+    count = math.ceil(size / SEGMENT_BYTES)
+    finished = _finished_segments(part, count)
+    missing = [index for index in range(count) if index not in finished]
+    held = sum(_segment_end(index, size) - index * SEGMENT_BYTES for index in finished)
+    _require_disk(part.parent, size - held)
+    paths.prepare_part(part, size)
+    progress(held)
+    failed = threading.Event()
+
+    def fetch(index: int) -> int:
+        start = index * SEGMENT_BYTES
+        end = _segment_end(index, size)
+        _fetch_segment(api, remote_path, part, start, end, size, cancel, failed, progress)
+        return index
+
+    with ThreadPoolExecutor(max_workers=DOWNLOAD_CONNECTIONS) as pool:
+        futures = [pool.submit(fetch, index) for index in missing]
+        with _finished_log(part).open("a") as log:
+            try:
+                for future in as_completed(futures):
+                    log.write(f"{future.result()}\n")
+                    log.flush()
+            except BaseException:
+                failed.set()
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
+
+
+def _segment_end(index: int, size: int) -> int:
+    return min((index + 1) * SEGMENT_BYTES, size)
+
+
+def _require_disk(folder: Path, needed: int) -> None:
+    folder.mkdir(parents=True, exist_ok=True)
+    free = shutil.disk_usage(folder).free
+    if free < needed:
+        raise TransferError(f"not enough disk: {_human(needed)} needed, {_human(free)} free")
+
+
+def _fetch_segment(
+    api: Api,
+    remote_path: str,
+    part: Path,
+    start: int,
+    end: int,
+    size: int,
+    cancel: threading.Event,
+    failed: threading.Event,
+    progress: Callable[[int], None],
+) -> None:
+    position = start
+    failures = 0
+    with paths.open_segment(part) as out:
+        while position < end:
+            before = position
+            try:
+                ranged, chunks = api.iter_file(remote_path, position, end)
+                if not ranged and end - start < size:
+                    raise _RangeIgnored
+                out.seek(position)
+                for chunk in chunks:
+                    if cancel.is_set() or failed.is_set():
+                        raise Cancelled("interrupted")
+                    out.write(chunk)
+                    position += len(chunk)
+                    progress(len(chunk))
+                if position < end:
+                    raise NetworkError(f"connection closed at byte {position} of {size}")
+            except NetworkError as exc:
+                failures = 1 if position > before else failures + 1
+                if failures > MAX_RETRIES or not is_transient(exc):
+                    raise
+                _pause(failures, cancel)
+        out.flush()
+        os.fsync(out.fileno())
 
 
 def _hash_existing(part: Path, sha: hashlib._Hash, size: int) -> int:

@@ -149,15 +149,16 @@ class FakeApi:
             raise ApiError(f"not found: {api_path}", status=404)
         return self.files[api_path]
 
-    def iter_file(self, api_path: str, offset: int = 0):
-        """Raw streaming read. Returns (resumed, chunks) like Api.iter_file."""
+    def iter_file(self, api_path: str, offset: int = 0, end: int | None = None):
+        """Raw streaming read. Returns (ranged, chunks) like Api.iter_file."""
         self.content_reads.append(api_path)
         if api_path not in self.files:
             from jp.errors import ApiError
 
             raise ApiError(f"not found: {api_path}", status=404)
-        body = self.files[api_path][offset:]
-        return offset > 0, iter([body[i : i + 1024] for i in range(0, len(body), 1024)])
+        body = self.files[api_path][offset:end]
+        ranged = offset > 0 or end is not None
+        return ranged, iter([body[i : i + 1024] for i in range(0, len(body), 1024)])
 
     def hash(self, api_path: str, *, timeout: float | None = None) -> str | None:
         """Cheap server-side sha256 (content=0&hash=1) -- no body download."""
@@ -232,6 +233,12 @@ class FakeApi:
             self.dirs.discard(api_path)
             return
         # Missing path: the real Api.delete swallows 404 silently.
+
+    def create_terminal(self, cwd: str | None = None):
+        """Terminals disabled, unless a test replaces this."""
+        from jp.errors import ApiError
+
+        raise ApiError("terminals disabled", status=404)
 
     def status_probe(self) -> StatusResult:
         """Scripted health probe mirroring Api.status_probe's outcomes."""

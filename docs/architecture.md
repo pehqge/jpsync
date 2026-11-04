@@ -19,7 +19,8 @@ src/jp/
 ├── index.py        # .jp/index: the last-synced base state
 ├── ignore.py       # built-in ignores + .jpignore matching; dotfile policy
 ├── sync.py         # scan, 3-way diff, push, pull engine
-├── transfer.py     # chunked upload, streaming download, retries, worker pool
+├── transfer.py     # chunked upload, segmented download, retries, worker pool
+├── bundle.py       # many small files through one archive
 └── commands/       # one module per subcommand
 ```
 
@@ -65,7 +66,20 @@ src/jp/
 
 - **Downloads of large files use `/files`, not the Contents API.** It serves raw
   bytes with `Range` support and no base64. Redirects stay unfollowed, because a
-  stopped server answers with a login page and a 200.
+  stopped server answers with a login page and a 200. Several connections fetch
+  32 MiB segments into a preallocated file, and a log records each finished segment
+  so a later run skips it. The final SHA-256 covers the whole file, so a wrong log
+  costs a re-download, never a bad file.
+
+- **A big tree moves as one archive.** The limit on a Hub is usually requests per
+  second, which no amount of parallelism gets past, so reducing requests is the
+  only fix. Twenty or more small files become one archive, built by the side that
+  has them: locally on push, by a script run in a server terminal on pull. The
+  script on the server is confined by checks of its own, because a terminal is
+  outside the path-jail: it refuses absolute paths, `..`, anything but a regular
+  file, a folder that resolves outside the prefix, and writing through a link. On
+  pull, `jp` extracts only the names it asked for, through the same safe write as
+  any other download. Any failure falls back to one request per file.
 
 - **Bulk runs are parallel where the cost is network.** Transfers, per-level remote
   listing and first-sync hashing use a pool of six workers, and only the main
