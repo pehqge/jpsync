@@ -5,6 +5,14 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0](https://github.com/pehqge/jpsync/compare/v1.3.0...v1.4.0) (2026-11-04)
+
+
+### Features
+
+* **sync:** archive big trees and download over six connections ([#37](https://github.com/pehqge/jpsync/issues/37)) ([c533ef5](https://github.com/pehqge/jpsync/commit/c533ef50d636d3845fe3a58569a7beb64c5c6fd4))
+* **sync:** transfer files of any size and large trees safely ([#35](https://github.com/pehqge/jpsync/issues/35)) ([c2bdb67](https://github.com/pehqge/jpsync/commit/c2bdb677886ef741154584d5a6149f9695aeb992))
+
 ## [1.3.0](https://github.com/pehqge/jpsync/compare/v1.2.0...v1.3.0) (2026-06-05)
 
 
