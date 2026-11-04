@@ -36,11 +36,14 @@ from __future__ import annotations
 import base64
 import ipaddress
 import json
+import re
 import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Iterator
 from dataclasses import dataclass
+from http.client import HTTPException
 from typing import Any
 
 from . import ui
@@ -48,13 +51,16 @@ from .errors import ApiError, AuthError, NetworkError, ServerDownError
 
 _DEFAULT_TIMEOUT = 30.0
 
-# Warn (do not hard-fail) before loading a very large file fully into memory:
-# there is no chunking and base64 inflates payloads by ~33% (see docs/architecture.md).
+# Warn before a single-request upload this big. Push and pull never get here, they
+# use transfer.py; this guards the callers that PUT in one go, such as `jp run`.
 _LARGE_FILE_WARN_BYTES = 50 * 1024 * 1024  # ~50 MiB
 
 # Extensions we treat as opaque bytes even though the server reports them as a
 # "notebook" model. Forcing type=file keeps the bytes faithful (research §11).
 _NOTEBOOK_EXTS = (".ipynb",)
+
+_STREAM_READ_BYTES = 1024 * 1024
+_JP_QUERY = re.compile(r"\?(?:content|type|format|hash)=[^?/]*\Z")
 
 
 @dataclass
@@ -195,12 +201,13 @@ class Api:
         # verbatim -- otherwise '?', '=' and '&' get encoded too and the server
         # treats the whole thing as a literal filename, silently ignoring every
         # query parameter (content/hash/type/format).
+        #
+        # Only a query jp itself appended counts: a '?' earlier in the string belongs
+        # to the file name.
         raw = api_path.lstrip("/")
-        if "?" in raw:
-            path_part, query = raw.split("?", 1)
-            query = f"?{query}"
-        else:
-            path_part, query = raw, ""
+        matched = _JP_QUERY.search(raw)
+        path_part = raw[: matched.start()] if matched else raw
+        query = matched.group() if matched else ""
         quoted = urllib.parse.quote(path_part, safe="/")
         return f"{self.base_url}/{quoted}{query}"
 
@@ -209,6 +216,8 @@ class Api:
         method: str,
         api_path: str,
         body: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
     ) -> Any:
         url = self._url(api_path)
         data = None
@@ -223,7 +232,7 @@ class Api:
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
             with urllib.request.urlopen(
-                req, timeout=self.timeout, context=self._ssl_context
+                req, timeout=timeout or self.timeout, context=self._ssl_context
             ) as resp:
                 payload = resp.read()
                 if not payload:
@@ -278,6 +287,8 @@ class Api:
         msg = f"server returned HTTP {status}"
         if detail:
             msg += f": {detail}"
+        if status in (301, 302, 303, 307, 308):
+            raise ServerDownError()
         if status in (401, 403):
             raise AuthError(msg)
         raise ApiError(msg, status=status)
@@ -327,7 +338,7 @@ class Api:
             return self._to_entry(data)
         return None
 
-    def hash(self, api_path: str) -> str | None:
+    def hash(self, api_path: str, *, timeout: float | None = None) -> str | None:
         """Return the server-computed **sha256** of a file WITHOUT downloading it.
 
         Uses ``?content=0&hash=1`` -- the cheapest, most definitive remote
@@ -345,7 +356,9 @@ class Api:
         push/pull for every jupytext-paired extension (the ``.md`` sync bug).
         """
         try:
-            data = self._request("GET", f"api/contents/{api_path}?content=0&hash=1&type=file")
+            data = self._request(
+                "GET", f"api/contents/{api_path}?content=0&hash=1&type=file", timeout=timeout
+            )
         except ApiError as exc:
             if exc.status == 404:
                 return None
@@ -385,6 +398,43 @@ class Api:
         if content is None:
             return b""
         return str(content).encode("utf-8")
+
+    def iter_file(self, api_path: str, offset: int = 0) -> tuple[bool, Iterator[bytes]]:
+        """Stream raw bytes from ``/files``, without base64 and without buffering.
+
+        Returns ``(resumed, chunks)``: ``resumed`` is False when the server ignored
+        the ``Range`` and is sending from byte 0. Redirects stay unfollowed, because
+        a stopped server answers with its HTML login page and a 200.
+        """
+        headers = {"Authorization": f"token {self._token}"}
+        if offset:
+            headers["Range"] = f"bytes={offset}-"
+        req = urllib.request.Request(self._url(f"files/{api_path}"), headers=headers)
+        opener = urllib.request.build_opener(
+            _NoRedirect, urllib.request.HTTPSHandler(context=self._ssl_context)
+        )
+        try:
+            resp = opener.open(req, timeout=self.timeout)
+        except urllib.error.HTTPError as exc:
+            self._raise_for_http(exc)
+            raise
+        except urllib.error.URLError as exc:
+            raise NetworkError(f"network error talking to server: {exc.reason}") from exc
+        except (TimeoutError, OSError) as exc:
+            raise NetworkError(f"network error: {exc}") from exc
+        return resp.status == 206, self._read_stream(resp)
+
+    @staticmethod
+    def _read_stream(resp: Any) -> Iterator[bytes]:
+        with resp:
+            while True:
+                try:
+                    chunk = resp.read(_STREAM_READ_BYTES)
+                except (HTTPException, OSError) as exc:
+                    raise NetworkError(f"download interrupted: {exc}") from exc
+                if not chunk:
+                    return
+                yield chunk
 
     # --- write operations (caller MUST have asserted within prefix) ---------
     def put_file_bytes(self, api_path: str, data: bytes) -> RemoteEntry:
@@ -432,6 +482,21 @@ class Api:
                 last_modified="",
             )
         return PutResult(entry=entry, created=created)
+
+    def put_chunk(self, api_path: str, data: bytes, number: int) -> None:
+        """Send one piece of a chunked upload.
+
+        The server's numbering: 1 replaces the file, -1 appends and closes the
+        upload, anything else appends. Appending is not idempotent, so a caller
+        must learn the real size before resending (see transfer.py).
+        """
+        body = {
+            "type": "file",
+            "format": "base64",
+            "content": base64.b64encode(data).decode("ascii"),
+            "chunk": number,
+        }
+        self._request("PUT", f"api/contents/{api_path}", body=body)
 
     def _warn_if_large(self, api_path: str, nbytes: int) -> None:
         if nbytes >= self.large_file_warn_bytes and api_path not in self._warned_large:
@@ -516,7 +581,8 @@ class Api:
         )
 
     def delete(self, api_path: str) -> None:
-        """Delete a remote path. Used ONLY by ``jp rm`` (gated).
+        """Delete a remote path: ``jp rm`` (gated), mirror mode after confirmation,
+        and jp's own temporary files.
 
         DELETE is NOT recursive on this server: a non-empty directory returns
         400 "not empty" (research §5). ``jp rm --recursive`` walks bottom-up.

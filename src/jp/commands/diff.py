@@ -9,7 +9,7 @@ from __future__ import annotations
 import argparse
 import difflib
 
-from .. import ui
+from .. import transfer, ui
 from ..errors import EXIT_OK
 from ..sync import Change
 from . import _context
@@ -43,6 +43,11 @@ def run(args: argparse.Namespace) -> int:
             ui.heading(f"local-only: {st.rel}")
             continue
 
+        if _too_large_to_diff(ctx.root, st):
+            ui.heading(f"{st.rel}: large file differs")
+            shown += 1
+            continue
+
         local_text = _read_local_text(ctx.root, st.rel)
         remote_text = _read_remote_text(api, st)
         if local_text is None or remote_text is None:
@@ -64,6 +69,14 @@ def run(args: argparse.Namespace) -> int:
     if shown == 0:
         ui.info("no textual differences")
     return EXIT_OK
+
+
+def _too_large_to_diff(root, st) -> bool:
+    """A text diff holds both versions in memory, so it stops where sync streams."""
+    path = root / st.rel
+    local_size = path.stat().st_size if path.is_file() else 0
+    remote_size = (st.remote_entry.size or 0) if st.remote_entry else 0
+    return max(local_size, remote_size) >= transfer.LARGE_FILE_BYTES
 
 
 def _read_local_text(root, rel: str) -> str | None:

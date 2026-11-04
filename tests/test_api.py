@@ -550,3 +550,11 @@ def test_create_kernel_posts_and_returns_id(monkeypatch):
     assert api.create_kernel() == "KID"
     assert seen["method"] == "POST"
     assert seen["url"] == "https://hub.example/user/alice/api/kernels"  # exact, single /api
+
+
+def test_question_mark_in_a_file_name_is_part_of_the_path():
+    api = Api("https://hub.example/user/me", "tok")
+    assert api._url("api/contents/a?b.bin").endswith("/api/contents/a%3Fb.bin")
+    assert api._url("api/contents/a?b.bin?content=0&type=file").endswith(
+        "/api/contents/a%3Fb.bin?content=0&type=file"
+    )

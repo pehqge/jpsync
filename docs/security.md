@@ -8,7 +8,7 @@ afterthought. This document explains the guarantees and how they are enforced.
 
 1. **`push` and `pull` never delete.** Synchronization is additive. A file that
    exists on one side and not the other is uploaded/downloaded or left alone —
-   never removed. The only command that deletes is `jp rm`, and it is gated
+   never removed. The only command that deletes your files is `jp rm`, and it is gated
    (dry-run + typed confirmation + per-call path validation).
 
 2. **Conflicts are never silently overwritten.** `jp` keeps a base state (the
@@ -58,6 +58,11 @@ it behaves:
 
 - Creating a hidden file (a dotfile) is rejected by the server, so `jp` skips
   dotfiles on push and reports them rather than failing the whole run.
+- Pushing a new version of a file of 16 MiB or more replaces it through a rename,
+  which the server cannot do over an existing file: the previous version moves
+  aside, the new one takes its name, and `jp` deletes the moved copy and its own
+  temporary files. This happens only for a file `push` was going to overwrite
+  anyway, and only after the new content passes its checksum.
 - A remote delete may move the file to a trash folder rather than erasing it,
   and in some cases corrupts the parent directory listing. This is why deletion
   is never part of normal sync.

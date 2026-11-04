@@ -39,6 +39,7 @@ runs — macOS, Windows, Linux.
 - **Git-like workflow** — `jp clone`, `jp status`, `jp push`, `jp pull`. Same muscle memory.
 - **Or skip the copy** — `jp live <url>` mounts the remote folder as a local folder you edit in place, and `jp terminal` drops you into a shell on the server. No SSH, no FUSE, no server-side install.
 - **Safe by default** — on a *shared* research machine, jp never deletes remote files unless you explicitly turn that on, and even then it asks you file-by-file. Conflicts are never silently overwritten.
+- **Handles big files and big trees** — files of any size move in chunks with a checksum at the end, resume after a dropped connection, and never load into memory. Thousands of small files go through in parallel.
 - **Zero dependencies** — one install, no dependency hell; ships as a wheel, a single `.pyz`, or a standalone binary.
 - **Cross-platform** — macOS, Windows, Linux; Python 3.9 → 3.13.
 
@@ -452,6 +453,13 @@ never get pushed by accident.
 **Will it overwrite my work?** Never silently. A conflict aborts that file;
 remote deletes are opt-in (mirror mode) and confirmed file-by-file.
 
+**How big can a file be?** `jp` has no size limit: only the disk on each side and
+the time it takes. Files of 16 MiB or more go in 8 MiB chunks, so memory use stays
+flat whatever the file size. An upload lands under a temporary `__jp_part__.*` name
+and replaces the real file only after the server's SHA-256 matches. A download goes
+to `.jp/parts/` and replaces the local file only after its SHA-256 matches. See
+[large files and bulk runs](docs/commands.md#large-files-and-bulk-runs).
+
 **Can I edit notebooks locally in VS Code but run them on the remote GPUs?** Yes —
 that's a core workflow. Sync with jp, then connect VS Code to your remote kernel.
 One catch: a remote kernel starts in the server's home, not your notebook's
@@ -464,7 +472,8 @@ walkthrough (connecting the kernel + the cwd fix) is in
 - **`jp: command not found`** — run `pipx ensurepath` / `uv tool update-shell`, reopen the terminal.
 - **`your JupyterHub server appears to be stopped`** — open the Hub UI and click *Start My Server*.
 - **`authentication failed` / HTTP 403** — your token expired; create a new one and `jp login` again (or update the token file).
-- **A big upload times out** — raise the timeout: `jp config set timeout 120`.
+- **A big transfer was interrupted** — run the same `jp push` or `jp pull` again. It continues from the last byte the other side has.
+- **A `__jp_part__.*` file shows up on the server** — an upload that never finished. It is invisible to sync; the same file resumes from it. If you changed the file or gave up, remove it with `jp rm`.
 - **`FileNotFoundError` / relative paths fail in VS Code with a remote kernel** — the kernel starts in the server's home, not your notebook's folder. Run `jp kernel` (see the [VS Code remote-kernel guide](docs/vscode-remote-cwd.md)).
 
 Run `jp doctor` for a guided check.

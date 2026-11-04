@@ -57,6 +57,29 @@ remote file. Hidden files (dotfiles) are skipped and reported (the server
 rejects them) without aborting the run. Conflicts abort that file rather than
 overwriting a newer remote version. `--dry-run` previews.
 
+### Large files and bulk runs
+`push` and `pull` work the same at any scale; there is nothing to configure.
+
+- **Six transfers run at once**, so a tree of thousands of small files is limited
+  by the server rather than by one-at-a-time requests. A transient network or
+  server error is retried with backoff. One failed file never stops the others,
+  and the summary names each failure with its reason.
+- **Files of 16 MiB or more never load into memory.** Uploads go in 8 MiB chunks
+  to a temporary `__jp_part__.*` file next to the destination; downloads stream
+  from the raw `/files` endpoint to `.jp/parts/`.
+- **The real file only changes after a checksum match.** An upload is verified
+  against the SHA-256 the server computes, then renamed over the destination, so
+  a failed run leaves the previous version in place. If the swap itself fails, the
+  previous version is put back. Overwriting moves the previous version to the
+  server's trash when the server has one, so it can use quota until the trash is
+  emptied.
+- **An interrupted run resumes.** Run the same command again: `jp` asks the server
+  how many bytes it has (or checks `.jp/parts/`) and continues from there. Changing
+  the file in the meantime starts a new upload; the old `__jp_part__.*` file stays
+  until you remove it with `jp rm`.
+
+Sync never shows `__jp_part__.*` files, so a half-finished upload is never pulled.
+
 ### Mirror mode (`--mirror` / config `mirror`)
 By default, sync is additive. With mirror mode on, `push`/`pull` additionally
 *offer to delete* files that exist on one side but not the other:
@@ -207,6 +230,11 @@ Editable settings: `mirror`, `dotfiles`, `color`, `timeout`. Connection fields
 ### `jp ignore [pattern...]`
 Add or list `.jpignore` patterns (gitignore-style). Always-on ignores include
 `.jp/`, `.git/`, `__pycache__/`, `.ipynb_checkpoints/`, `.DS_Store`, `*.pyc`.
+
+Patterns apply to both sides: an ignored remote file is not pulled, shown by
+`status`, or offered for deletion in mirror mode, and an ignored remote folder is
+not even listed. This is the way to keep a folder of models on the server without
+`pull` trying to bring them down.
 
 ### `jp doctor`
 Diagnose your setup: token present and valid, server reachable, server running

@@ -31,11 +31,15 @@ import posixpath
 import re
 import unicodedata
 from pathlib import Path, PurePosixPath
+from typing import BinaryIO
 
 from .errors import SafetyError
 
 # Name of the per-repo metadata directory living at the local root.
 DOT_DIR = ".jp"
+# Temporary name of an unfinished chunked upload. Not hidden, because the server
+# refuses dotfiles, so every remote scan has to skip it instead.
+PART_PREFIX = "__jp_part__."
 # Remote temp dir used for atomic remote writes. Deliberately has NO leading dot
 # because the server runs with allow_hidden=False (a dotted name -> HTTP 400).
 REMOTE_TMP_DIR = "jp-tmp"
@@ -369,6 +373,22 @@ def atomic_write(dest: Path, data: bytes) -> None:
 # O_NOFOLLOW exists on POSIX; on Windows it is absent, so fall back to 0 and
 # rely on the explicit is_symlink() checks above.
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
+def open_part(path: Path) -> BinaryIO:
+    """Open a private ``.jp`` part file for appending, refusing a planted symlink."""
+    _ensure_dir_no_symlink(Path(path).parent)
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND | _O_NOFOLLOW, 0o600)
+    return os.fdopen(fd, "ab")
+
+
+def atomic_install(part: Path, dest: Path) -> None:
+    """Move a finished part onto ``dest`` with the guarantees of :func:`atomic_write`."""
+    dest = Path(dest)
+    _ensure_dir_no_symlink(dest.parent)
+    if dest.is_symlink():
+        raise SafetyError(f"refusing to write through a symlink: {dest}")
+    os.replace(str(part), str(dest))
 
 
 def _ensure_dir_no_symlink(directory: Path) -> None:

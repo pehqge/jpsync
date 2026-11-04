@@ -92,6 +92,10 @@ class ServerDownError(NetworkError):
         super().__init__(message)
 
 
+class TransferError(JpError):
+    """A transfer finished but its bytes cannot be trusted."""
+
+
 class SafetyError(JpError):
     """A safety invariant would have been violated; the operation was refused.
 

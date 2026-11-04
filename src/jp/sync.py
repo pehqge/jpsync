@@ -21,21 +21,31 @@ from __future__ import annotations
 
 import hashlib
 import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Callable
+from typing import Callable, TypeVar
 
-from . import paths, ui
+from . import paths, transfer, ui
 from .api import Api, RemoteEntry
 from .config import Config
-from .errors import ApiError, JpError
+from .errors import ApiError, JpError, TransferError
 from .ignore import IgnoreSet
 from .index import Entry, Index
 
 # --------------------------------------------------------------------------- #
 # Data model
 # --------------------------------------------------------------------------- #
+
+
+# Rewriting the index once per file is quadratic in a bulk run. A crash can lose
+# this much progress, which the next run recovers by comparing hashes.
+INDEX_SAVE_INTERVAL_S = 2.0
+
+Job = TypeVar("Job", "_Upload", "_Download")
 
 
 class Change(Enum):
@@ -150,29 +160,46 @@ def _rel_posix(rel_dir: str, name: str) -> str:
 # --------------------------------------------------------------------------- #
 # Remote scan
 # --------------------------------------------------------------------------- #
-def scan_remote(api: Api, cfg: Config) -> dict[str, RemoteEntry]:
-    """Recursively list the remote prefix; return {rel_posix: RemoteEntry}.
+def scan_remote(api: Api, cfg: Config, ignore: IgnoreSet | None = None) -> dict[str, RemoteEntry]:
+    """List the remote prefix level by level; return {rel_posix: RemoteEntry}.
 
     Keys are made RELATIVE to the prefix. Each remote name is validated via
     ``safe_local_dest``-style normalization so a hostile listing entry like
-    ``../../etc/x`` cannot become a sync target.
+    ``../../etc/x`` cannot become a sync target. Ignored folders are not even
+    listed, and jp's own unfinished uploads never show up.
     """
     prefix = paths.validate_prefix(cfg.prefix)
     result: dict[str, RemoteEntry] = {}
-    _walk_remote(api, prefix, prefix, result)
+    pending = [prefix]
+    with ThreadPoolExecutor(max_workers=transfer.WORKERS) as pool:
+        while pending:
+            listings = list(pool.map(lambda path: _list_remote_dir(api, path), pending))
+            pending = []
+            for entries in listings:
+                pending += _collect_entries(entries, prefix, ignore, result)
     return result
 
 
-def _walk_remote(api: Api, prefix: str, api_path: str, acc: dict[str, RemoteEntry]) -> None:
+def _list_remote_dir(api: Api, api_path: str) -> list[RemoteEntry]:
     # A single corrupted entry can make the server return 400 "is not a
     # directory" for a GET on the PARENT (observed: a trashed/half-deleted child
     # poisons the parent listing). Degrade with a warning instead of aborting the
     # whole status/pull (see docs/architecture.md).
     try:
-        entries = api.list_dir(api_path)
+        return api.list_dir(api_path)
     except ApiError as exc:
         ui.warn(f"skipping unreadable remote directory {api_path!r}: {exc.message}")
-        return
+        return []
+
+
+def _collect_entries(
+    entries: list[RemoteEntry],
+    prefix: str,
+    ignore: IgnoreSet | None,
+    acc: dict[str, RemoteEntry],
+) -> list[str]:
+    """File the entries into ``acc``; return the subfolders still to list."""
+    subfolders: list[str] = []
     for entry in entries:
         # Defensive: validate the server-supplied path stays under the prefix.
         try:
@@ -181,8 +208,11 @@ def _walk_remote(api: Api, prefix: str, api_path: str, acc: dict[str, RemoteEntr
             # Skip anything the server claims is outside our prefix.
             continue
         rel = inside[len(prefix) + 1 :] if inside != prefix else ""
+        if entry.name.startswith(paths.PART_PREFIX):
+            continue
         if entry.type == "directory":
-            _walk_remote(api, prefix, entry.path, acc)
+            if ignore is None or not ignore.is_ignored(rel, is_dir=True):
+                subfolders.append(entry.path)
         elif rel:
             # Re-validate the relative name is traversal-free.
             try:
@@ -202,7 +232,9 @@ def _walk_remote(api: Api, prefix: str, api_path: str, acc: dict[str, RemoteEntr
                 key = paths.normalize_rel(key)
             except JpError:
                 continue
-            acc[key] = entry
+            if ignore is None or not ignore.is_ignored(key):
+                acc[key] = entry
+    return subfolders
 
 
 # --------------------------------------------------------------------------- #
@@ -224,8 +256,10 @@ def diff(
     conflict or modification to resolve and ``fetch_remote_content`` is True.
     """
     local = scan_local(root, ignore)
-    remote = scan_remote(api, cfg)
-    rels = sorted(set(local) | set(remote) | set(index.entries))
+    remote = scan_remote(api, cfg, ignore)
+    known = (rel for rel in index.entries if not _under_ignored_rule(rel, ignore))
+    rels = sorted(set(local) | set(remote) | set(known))
+    hashed = _prefetch_hashes(api, local, remote, index) if fetch_remote_content else {}
 
     states: list[FileState] = []
     for rel in rels:
@@ -242,6 +276,7 @@ def diff(
         # we only download to confirm a real change/conflict. A module-level
         # factory binds the loop values explicitly (no closure-over-loop-var bug).
         cache = _RemoteHashCache()
+        cache.value = hashed.get(rel)
         remote_hash = _make_remote_hash(api, rentry, cache, fetch_remote_content)
 
         change = _classify(
@@ -268,6 +303,39 @@ def diff(
             )
         )
     return states
+
+
+def _under_ignored_rule(rel: str, ignore: IgnoreSet) -> bool:
+    """True if ``rel`` or one of its parent folders is ignored."""
+    parts = rel.split("/")
+    folders = ("/".join(parts[:i]) for i in range(1, len(parts)))
+    return ignore.is_ignored(rel) or any(ignore.is_ignored(d, is_dir=True) for d in folders)
+
+
+def _prefetch_hashes(
+    api: Api,
+    local: dict[str, Path],
+    remote: dict[str, RemoteEntry],
+    index: Index,
+) -> dict[str, str]:
+    """Hash in parallel every file on both sides that has no base to compare with,
+    the case of a first sync over an existing tree."""
+    pending = [rel for rel in local if rel in remote and index.get(rel) is None]
+    with ThreadPoolExecutor(max_workers=transfer.WORKERS) as pool:
+        digests = pool.map(lambda rel: _server_hash(api, remote[rel]), pending)
+    return {rel: digest for rel, digest in zip(pending, digests) if digest}
+
+
+def _is_large(rentry: RemoteEntry) -> bool:
+    return rentry.size is not None and rentry.size >= transfer.LARGE_FILE_BYTES
+
+
+def _server_hash(api: Api, rentry: RemoteEntry) -> str | None:
+    timeout = transfer.HASH_TIMEOUT_S if _is_large(rentry) else None
+    try:
+        return api.hash(rentry.path, timeout=timeout)
+    except Exception:
+        return None
 
 
 class _RemoteHashCache:
@@ -300,16 +368,15 @@ def _make_remote_hash(
         if not fetch_remote_content:
             return None
         # Cheap server-side sha256 -- no body transfer.
-        try:
-            digest = api.hash(rentry.path)
-        except Exception:
-            digest = None
+        digest = _server_hash(api, rentry)
         if digest:
             cache.value = digest
             return cache.value
         # Fallback: server gave no hash -> download and hash locally.
-        data = api.get_file_bytes(rentry.path)
-        cache.value = sha256_bytes(data)
+        if _is_large(rentry):
+            cache.value = transfer.stream_sha256(api, rentry)
+        else:
+            cache.value = sha256_bytes(api.get_file_bytes(rentry.path))
         return cache.value
 
     return remote_hash
@@ -406,7 +473,7 @@ def push(
     prefix = paths.validate_prefix(cfg.prefix)
     outcome = Outcome()
     states = diff(root, cfg, api, index, ignore)
-    created_dirs: set[str] = set()
+    uploads: list[_Upload] = []
     # "protect" uploads dotfiles under a reversible server-safe alias; the default
     # "skip" policy reports them and never uploads (the server rejects hidden names).
     protect = cfg.dotfiles == "protect"
@@ -438,51 +505,26 @@ def push(
             outcome.transferred.append(rel)
             continue
 
+        # Under "protect", hidden segments are aliased to a server-safe name
+        # (non-hidden segments pass through unchanged); the index/outcome keep
+        # the real (dotted) rel as the canonical key.
+        wire_rel = paths.encode_protected(rel) if protect else rel
+        remote_path = paths.remote_path_for(prefix, wire_rel)
+        uploads.append(_Upload(rel, root / rel, remote_path, st.local_sha))
+
+    if uploads:
+        created_dirs: set[str] = set()
+        meter = transfer.Meter("push", _local_bytes(uploads), len(uploads))
+
+        def upload(job: _Upload, cancel: threading.Event) -> Entry:
+            entry = _upload_one(api, prefix, job, created_dirs, cancel, meter)
+            meter.file_done()
+            return entry
+
         try:
-            lpath = root / rel
-            data = lpath.read_bytes()
-            # Under "protect", hidden segments are aliased to a server-safe name
-            # (non-hidden segments pass through unchanged); the index/outcome keep
-            # the real (dotted) rel as the canonical key.
-            wire_rel = paths.encode_protected(rel) if protect else rel
-            remote_path = paths.remote_path_for(prefix, wire_rel)
-            _ensure_remote_dirs(api, prefix, remote_path, created_dirs)
-            # SAFETY: assert immediately before the mutating call.
-            paths.assert_within_prefix(remote_path, prefix)
-            # Direct whole-file PUT. The Contents API PUT is not a streaming
-            # append, so a failed PUT does not partially write (threat model
-            # T11); a temp+rename buys nothing here AND cannot overwrite an
-            # existing file (PATCH onto an existing target returns 409).
-            api.put_file_bytes(remote_path, data)
-            # Post-write verification: re-stat and confirm the size matches what
-            # we sent. On mismatch, record a failure and do NOT update the index
-            # (and never delete the local source).
-            agreed_sha = sha256_bytes(data)
-            # as_file=True: a jupytext server would otherwise report the
-            # converted-notebook size for a .md/.py file and trip a false
-            # "post-write size mismatch" on every such upload.
-            rentry = api.stat(remote_path, as_file=True)
-            if rentry is not None and rentry.size is not None and rentry.size != len(data):
-                outcome.failures.append(
-                    (rel, f"post-write size mismatch (sent {len(data)}, server {rentry.size})")
-                )
-                continue
-            index.set(
-                rel,
-                Entry(
-                    sha256=agreed_sha,
-                    size=len(data),
-                    remote_mtime=rentry.last_modified if rentry else "",
-                    remote_hash=agreed_sha,  # server sha256 == agreed bytes' sha256
-                    local_mtime=_safe_mtime(lpath),
-                ),
-            )
-            index.save()  # persist incrementally: index reflects only real successes
-            outcome.transferred.append(rel)
-        except JpError as exc:
-            outcome.failures.append((rel, exc.message))
-        except OSError as exc:
-            outcome.failures.append((rel, str(exc)))
+            _run_jobs(uploads, upload, index, outcome)
+        finally:
+            meter.close()
 
     # Mirror-mode candidates: remote files with no local counterpart. The engine
     # NEVER deletes -- the command layer confirms each one (see commands/push.py).
@@ -492,6 +534,97 @@ def push(
         if st.remote_exists and not st.local_exists and not paths.is_hidden(st.rel)
     ]
     return outcome
+
+
+@dataclass(frozen=True)
+class _Upload:
+    rel: str
+    path: Path
+    remote_path: str
+    sha: str | None
+
+
+def _local_bytes(uploads: list[_Upload]) -> int:
+    return sum(_safe_size(job.path) for job in uploads)
+
+
+def _safe_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def _upload_one(
+    api: Api,
+    prefix: str,
+    job: _Upload,
+    created_dirs: set[str],
+    cancel: threading.Event,
+    meter: transfer.Meter,
+) -> Entry:
+    """Upload and verify one file. Raises instead of touching the index."""
+    size = job.path.stat().st_size
+    # SAFETY: assert immediately before the mutating calls.
+    paths.assert_within_prefix(job.remote_path, prefix)
+    transfer.with_retries(
+        lambda: _ensure_remote_dirs(api, prefix, job.remote_path, created_dirs), cancel
+    )
+    rentry: RemoteEntry | None = None
+    if size >= transfer.LARGE_FILE_BYTES:
+        sha = job.sha or sha256_file(job.path)
+        transfer.upload_large(api, job.path, job.remote_path, sha, size, prefix, cancel, meter.add)
+    else:
+        data = job.path.read_bytes()
+        size = len(data)
+        sha = sha256_bytes(data)
+        # A whole-file PUT is written atomically by the server (threat model T11),
+        # so it needs no temporary name and repeating it is harmless.
+        rentry = transfer.with_retries(lambda: api.put_file_bytes(job.remote_path, data), cancel)
+        meter.add(size)
+    # as_file=True: a jupytext server would otherwise report the
+    # converted-notebook size for a .md/.py file and trip a false
+    # "post-write size mismatch" on every such upload. The PUT response already
+    # answers for the common case, which halves the requests of a bulk run.
+    if rentry is None or rentry.size != size:
+        rentry = transfer.with_retries(lambda: api.stat(job.remote_path, as_file=True), cancel)
+    if rentry is not None and rentry.size is not None and rentry.size != size:
+        raise TransferError(f"post-write size mismatch (sent {size}, server {rentry.size})")
+    return Entry(
+        sha256=sha,
+        size=size,
+        remote_mtime=rentry.last_modified if rentry else "",
+        remote_hash=sha,  # server sha256 == agreed bytes' sha256
+        local_mtime=_safe_mtime(job.path),
+    )
+
+
+def _run_jobs(
+    jobs: list[Job],
+    work: Callable[[Job, threading.Event], Entry],
+    index: Index,
+    outcome: Outcome,
+) -> None:
+    """Run the transfers; the index reflects only verified successes."""
+    last_save = time.monotonic()
+
+    def record(job: Job, entry: Entry) -> None:
+        nonlocal last_save
+        index.set(job.rel, entry)
+        outcome.transferred.append(job.rel)
+        if time.monotonic() - last_save >= INDEX_SAVE_INTERVAL_S:
+            index.save()
+            last_save = time.monotonic()
+
+    def fail(job: Job, exc: JpError | OSError) -> None:
+        outcome.failures.append((job.rel, exc.message if isinstance(exc, JpError) else str(exc)))
+
+    try:
+        transfer.run_parallel(jobs, work, record, fail)
+    finally:
+        index.save()
+    outcome.transferred.sort()
+    outcome.failures.sort()
 
 
 def _ensure_remote_dirs(api: Api, prefix: str, remote_path: str, created: set[str]) -> None:
@@ -543,6 +676,7 @@ def pull(
     root = Path(root).resolve()
     outcome = Outcome()
     states = diff(root, cfg, api, index, ignore)
+    downloads: list[_Download] = []
 
     for st in states:
         rel = st.rel
@@ -560,34 +694,62 @@ def pull(
             outcome.transferred.append(rel)
             continue
 
+        downloads.append(_Download(rel, st.remote_entry, st.remote_sha))
+
+    if downloads:
+        total = sum(job.entry.size or 0 for job in downloads)
+        meter = transfer.Meter("pull", total, len(downloads))
+
+        def download(job: _Download, cancel: threading.Event) -> Entry:
+            entry = _download_one(api, root, job, cancel, meter)
+            meter.file_done()
+            return entry
+
         try:
-            data = api.get_file_bytes(st.remote_entry.path)
-            # SAFETY: sanitize the server-derived name before writing locally.
-            dest = paths.safe_local_dest(root, rel)
-            paths.atomic_write(dest, data)
-            # Verify and record index ONLY after success.
-            agreed_sha = sha256_bytes(data)
-            index.set(
-                rel,
-                Entry(
-                    sha256=agreed_sha,
-                    size=len(data),
-                    remote_mtime=st.remote_entry.last_modified,
-                    remote_hash=agreed_sha,  # downloaded bytes == server sha256
-                    local_mtime=_safe_mtime(dest),
-                ),
-            )
-            index.save()
-            outcome.transferred.append(rel)
-        except JpError as exc:
-            outcome.failures.append((rel, exc.message))
-        except OSError as exc:
-            outcome.failures.append((rel, str(exc)))
+            _run_jobs(downloads, download, index, outcome)
+        finally:
+            meter.close()
 
     # Mirror-mode candidates: local files with no remote counterpart. The engine
     # NEVER deletes -- the command layer confirms each one (see commands/pull.py).
     outcome.deletable = [st.rel for st in states if st.local_exists and not st.remote_exists]
     return outcome
+
+
+@dataclass(frozen=True)
+class _Download:
+    rel: str
+    entry: RemoteEntry
+    digest: str | None
+
+
+def _download_one(
+    api: Api, root: Path, job: _Download, cancel: threading.Event, meter: transfer.Meter
+) -> Entry:
+    """Download and verify one file. Raises instead of touching the index."""
+    # SAFETY: sanitize the server-derived name before writing locally.
+    dest = paths.safe_local_dest(root, job.rel)
+    if _is_large(job.entry) and job.entry.size is not None:
+        size = job.entry.size
+        digest = job.digest or _server_hash(api, job.entry)
+        part_name = hashlib.sha256(job.rel.encode()).hexdigest()
+        part = root / paths.DOT_DIR / "parts" / part_name
+        sha = transfer.download_large(
+            api, job.entry.path, dest, part, size, digest, cancel, meter.add
+        )
+    else:
+        data = transfer.with_retries(lambda: api.get_file_bytes(job.entry.path), cancel)
+        paths.atomic_write(dest, data)
+        size = len(data)
+        sha = sha256_bytes(data)
+        meter.add(size)
+    return Entry(
+        sha256=sha,
+        size=size,
+        remote_mtime=job.entry.last_modified,
+        remote_hash=sha,  # downloaded bytes == server sha256
+        local_mtime=_safe_mtime(dest),
+    )
 
 
 def _safe_mtime(path: Path) -> float:
