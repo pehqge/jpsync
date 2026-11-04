@@ -137,6 +137,10 @@ def set_quiet(value: bool) -> None:
     _quiet = bool(value)
 
 
+def is_quiet() -> bool:
+    return _quiet
+
+
 def out(message: str = "") -> None:
     """Print a normal line to stdout (redacted)."""
     if _quiet:

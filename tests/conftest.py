@@ -149,7 +149,17 @@ class FakeApi:
             raise ApiError(f"not found: {api_path}", status=404)
         return self.files[api_path]
 
-    def hash(self, api_path: str) -> str | None:
+    def iter_file(self, api_path: str, offset: int = 0):
+        """Raw streaming read. Returns (resumed, chunks) like Api.iter_file."""
+        self.content_reads.append(api_path)
+        if api_path not in self.files:
+            from jp.errors import ApiError
+
+            raise ApiError(f"not found: {api_path}", status=404)
+        body = self.files[api_path][offset:]
+        return offset > 0, iter([body[i : i + 1024] for i in range(0, len(body), 1024)])
+
+    def hash(self, api_path: str, *, timeout: float | None = None) -> str | None:
         """Cheap server-side sha256 (content=0&hash=1) -- no body download."""
         self.hash_reads.append(api_path)
         if api_path not in self.files:
@@ -175,6 +185,12 @@ class FakeApi:
         for i in range(1, len(parts)):
             self.dirs.add("/".join(parts[:i]))
         return self.stat(api_path)  # type: ignore[return-value]
+
+    def put_chunk(self, api_path: str, data: bytes, number: int) -> None:
+        """Mirror LargeFileManager: chunk 1 replaces the file, the others append."""
+        self.calls.append(("CHUNK", f"{api_path}#{number}"))
+        self.files[api_path] = data if number == 1 else self.files[api_path] + data
+        self.mtimes[api_path] = "2024-06-01T00:00:00Z"
 
     def mkdir(self, api_path: str) -> None:
         self.calls.append(("MKDIR", api_path))

@@ -19,6 +19,7 @@ src/jp/
 ├── index.py        # .jp/index: the last-synced base state
 ├── ignore.py       # built-in ignores + .jpignore matching; dotfile policy
 ├── sync.py         # scan, 3-way diff, push, pull engine
+├── transfer.py     # chunked upload, streaming download, retries, worker pool
 └── commands/       # one module per subcommand
 ```
 
@@ -51,6 +52,26 @@ src/jp/
   time (local registry before global), falling back to the legacy `token_path` /
   `~/.config/jp/token`. This lets one machine hold several servers' tokens while
   keeping secrets off the synced tree.
+
+- **Large files stay out of memory and resume from the other side's real state.**
+  The Contents API has no idempotent chunk: chunk 1 replaces the file and every
+  other chunk appends. So after any failure `transfer.py` reads the server's size
+  and continues from that byte, and only byte 0 may use chunk 1. Because that
+  protocol would destroy the destination, chunks go to a `__jp_part__.*` name,
+  chosen from the path and content hash so a later run finds it, and the swap into
+  place happens after the server's SHA-256 matches. The server's rename refuses an
+  existing target, so the previous version steps aside first and is restored if
+  the swap fails.
+
+- **Downloads of large files use `/files`, not the Contents API.** It serves raw
+  bytes with `Range` support and no base64. Redirects stay unfollowed, because a
+  stopped server answers with a login page and a 200.
+
+- **Bulk runs are parallel where the cost is network.** Transfers, per-level remote
+  listing and first-sync hashing use a pool of six workers, and only the main
+  thread touches the index. The index is saved at most every two seconds, since
+  saving per file is quadratic. A crash can lose that much progress, which the next
+  run recovers by comparing hashes.
 
 ## What is intentionally out of scope (for now)
 

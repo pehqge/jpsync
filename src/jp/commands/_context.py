@@ -44,7 +44,7 @@ def load_repo() -> RepoContext:
 def build_api(cfg: Config) -> Api:
     """Construct an Api client, loading the token (and registering it for redaction)."""
     token = config_mod.load_token(cfg)
-    return Api(cfg.base_url, token)
+    return Api(cfg.base_url, token, timeout=cfg.timeout)
 
 
 def choose_credential(args: object, root: Path | None = None) -> str:
